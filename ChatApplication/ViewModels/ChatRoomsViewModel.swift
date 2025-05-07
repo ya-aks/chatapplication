@@ -15,6 +15,7 @@ class ChatRoomsViewModel: ObservableObject {
     private let queue: MessageQueueProtocol
     var networkMonitor: NetworkMonitorProtocol
     private var cancellables = Set<AnyCancellable>()
+    private let messageQueue = DispatchQueue(label: "com.chatapp.messages", qos: .background, attributes: [])
 
     // MARK: init
     init(socket: ChatSocketProtocol, queue: MessageQueueProtocol, monitor: NetworkMonitorProtocol) {
@@ -28,34 +29,41 @@ class ChatRoomsViewModel: ObservableObject {
     }
     
     // MARK: Private Methods
+    private func updateRooms(roomId: String, message: Message? = nil) {
+        messageQueue.async { [weak self] in
+            guard let self else { return }
+            if case .rooms(var rooms) = self.state {
+                if let message = message {
+                    rooms[roomId, default: []].append(message)
+                } else {
+                    rooms[roomId] = []
+                }
+                self.update(state: .rooms(rooms))
+            } else {
+                self.update(state: .rooms([roomId: []]))
+            }
+        }
+    }
+    
     private func setupBindings() {
         chatSocket.onMessageReceived = { [weak self] roomId, message in
-            guard let self else {
-                return
-            }
-            
-            if case .rooms(var rooms) = self.state {
-                rooms[roomId, default: []].append(Message(content: message))
-                self.update(state: .rooms(rooms))
-            }
+            guard let self else { return }
+            self.updateRooms(roomId: roomId, message: Message(content: message))
         }
 
         chatSocket.onConnect = { [weak self] roomIds in
-            guard let self else {
-                return
-            }
+            guard let self else { return }
             let roomMessages = Dictionary(uniqueKeysWithValues: roomIds.map { ($0, [Message]()) })
             self.update(state: .rooms(roomMessages))
         }
 
         networkMonitor.onStatusChange = { [weak self] status in
-            guard let self else {
-                return
-            }
+            guard let self else { return }
             self.isConnected = status
         }
         
-        $isConnected.receive(on: DispatchQueue.main).sink { isConnected in
+        $isConnected.receive(on: DispatchQueue.main).sink { [weak self] isConnected in
+            guard let self else { return }
             if isConnected {
                 self.retryQueuedMessages()
             }
@@ -69,10 +77,8 @@ class ChatRoomsViewModel: ObservableObject {
                     do {
                         try chatSocket.sendMessage(msg.content, to: roomId)
                     } catch {
-                        DispatchQueue.main.async {
-                            self.state = .error("Failed to retry sending message: \(error.localizedDescription)")
-                            self.queue.enqueue(msg, for: roomId)
-                        }
+                        self.update(state: .error("Failed to retry sending message: \(error.localizedDescription)"))
+                        self.queue.enqueue(msg, for: roomId)
                     }
                 }
             }
@@ -85,28 +91,20 @@ class ChatRoomsViewModel: ObservableObject {
         }
     }
 
-    
     // MARK: Public Methods
     func createChatRoom(name: String) -> String? {
         guard isConnected else {
-            state = .error("Cannot create new chat room while offline")
+            update(state: .error("Cannot create new chat room while offline"))
             return nil
         }
         
         let roomId = "\(name)"
         do {
             try chatSocket.subscribe(to: roomId)
-            if case .rooms(var rooms) = state {
-                rooms[roomId] = []
-                state = .rooms(rooms)
-            } else {
-                state = .rooms([roomId: []])
-            }
+            updateRooms(roomId: roomId)
             return roomId
         } catch {
-            DispatchQueue.main.async {
-                self.update(state: .error("Failed to subscribe to chat room: \(error.localizedDescription)"))
-            }
+            update(state: .error("Failed to subscribe to chat room: \(error.localizedDescription)"))
             return nil
         }
     }
@@ -118,17 +116,14 @@ class ChatRoomsViewModel: ObservableObject {
             do {
                 try chatSocket.sendMessage(message, to: roomId)
             } catch {
-                self.update(state: .error("Failed to send message: \(error.localizedDescription)"))
-                self.queue.enqueue(newMessage, for: roomId)
+                update(state: .error("Failed to send message: \(error.localizedDescription)"))
+                queue.enqueue(newMessage, for: roomId)
             }
         } else {
             queue.enqueue(newMessage, for: roomId)
         }
         
-        if case .rooms(var rooms) = state {
-            rooms[roomId, default: []].append(newMessage)
-            state = .rooms(rooms)
-        }
+        updateRooms(roomId: roomId, message: newMessage)
     }
     
     func hasPendingMessages(for roomId: String) -> Bool {
